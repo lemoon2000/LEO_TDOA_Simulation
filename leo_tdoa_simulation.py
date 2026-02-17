@@ -806,18 +806,34 @@ class LEOSimulationGUI:
         for ax in [self.ax_3d, self.ax_2d, self.ax_error, self.ax_gdop]:
             ax.clear()
         
-        self.ax_3d.plot(mc_result['spacings']/1e3, mc_result['mean_errors'], 'b-o', linewidth=2)
-        self.ax_3d.fill_between(mc_result['spacings']/1e3, 
-                                mc_result['mean_errors'] - mc_result['std_errors'],
-                                mc_result['mean_errors'] + mc_result['std_errors'],
+        spacings_km = mc_result['spacings']/1e3
+        mean_errors = mc_result['mean_errors']
+        std_errors = mc_result['std_errors']
+        
+        valid_mask = np.isfinite(mean_errors)
+        if np.any(valid_mask):
+            y_max = np.max(mean_errors[valid_mask] + std_errors[valid_mask]) * 1.2
+            y_min = max(0, np.min(mean_errors[valid_mask] - std_errors[valid_mask]) * 0.8)
+        else:
+            y_max = 1000
+            y_min = 0
+        
+        self.ax_3d.plot(spacings_km, mean_errors, 'b-o', linewidth=2)
+        self.ax_3d.fill_between(spacings_km, 
+                                mean_errors - std_errors,
+                                mean_errors + std_errors,
                                 alpha=0.3)
         self.ax_3d.axhline(y=self.params.required_accuracy, color='r', linestyle='--', label='目标精度')
-        self.ax_3d.axvline(x=min_spacing/1e3, color='g', linestyle=':', label=f'最小间距: {min_spacing/1e3:.0f}km')
+        min_spacing_km = min_spacing/1e3
+        if min_spacing_km <= spacings_km[-1]:
+            self.ax_3d.axvline(x=min_spacing_km, color='g', linestyle=':', label=f'最小间距: {min_spacing_km:.0f}km')
         self.ax_3d.set_xlabel('卫星间距 (km)')
         self.ax_3d.set_ylabel('定位误差 (m)')
         self.ax_3d.set_title('定位误差 vs 卫星间距')
         self.ax_3d.legend()
         self.ax_3d.grid(True, alpha=0.3)
+        self.ax_3d.set_xlim(spacings_km[0], spacings_km[-1])
+        self.ax_3d.set_ylim(y_min, y_max)
         
         self.ax_2d.plot(mc_result['spacings']/1e3, mc_result['gdop_values'], 'g-s', linewidth=2)
         self.ax_2d.set_xlabel('卫星间距 (km)')
