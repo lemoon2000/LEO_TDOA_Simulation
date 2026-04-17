@@ -46,10 +46,10 @@ class SimulationParameters:
     emitter_eirp: float = 62.0  # dBm
     antenna_nx: int = 34  # Phased array elements in X
     antenna_ny: int = 44  # Phased array elements in Y
-    satellite_altitude: float = 500e3  # m
-    num_satellites: int = 4
-    satellite_spacing: float = 300e3  # m (along-track spacing)
-    required_accuracy: float = 100.0  # m
+    satellite_altitude: float = 600e3  # m
+    num_satellites: int = 3
+    satellite_spacing: float = 100e3  # m (along-track spacing)
+    required_accuracy: float = 1000.0  # m
     noise_figure: float = 3.0  # dB
     satellite_antenna_gain: float = 30.0  # dBi (satellite receive antenna)
     integration_time: float = 1e-3  # s
@@ -94,6 +94,7 @@ class TDOALocalizationSimulator:
         self.snr_values: Optional[List[float]] = None
         self.rx_power_values: Optional[List[float]] = None
         self.off_axis_angles: Optional[List[float]] = None
+        self.antenna_gain_losses: Optional[List[float]] = None
         self.gdop: Optional[float] = None
         
         self.emitter_antenna = PhasedArrayAntenna(
@@ -118,33 +119,64 @@ class TDOALocalizationSimulator:
         sat1_vel = np.array([0.0, 0.0, 0.0])
         self.satellites.append(Satellite(id=0, position=sat1_pos, velocity=sat1_vel))
         
-        if num_sats >= 4:
-            for i in range(3):
-                angle = i * 2 * np.pi / 3
-                
-                alpha = spacing / (2 * (R + altitude))
-                
-                x = spacing * np.sqrt(1 - alpha**2) * np.cos(angle)
-                y = spacing * np.sqrt(1 - alpha**2) * np.sin(angle)
-                z = altitude - spacing**2 / (2 * (R + altitude))
-                
-                position = np.array([x, y, z])
-                velocity = np.array([0.0, 0.0, 0.0])
-                
-                self.satellites.append(Satellite(id=i+1, position=position, velocity=velocity))
-        else:
-            for i in range(1, num_sats):
-                angle = (i - 1) * 2 * np.pi / (num_sats - 1)
-                
-                alpha = spacing / (2 * (R + altitude))
-                x = spacing * np.sqrt(1 - alpha**2) * np.cos(angle)
-                y = spacing * np.sqrt(1 - alpha**2) * np.sin(angle)
-                z = altitude - spacing**2 / (2 * (R + altitude))
-                
-                position = np.array([x, y, z])
-                velocity = np.array([0.0, 0.0, 0.0])
-                
-                self.satellites.append(Satellite(id=i, position=position, velocity=velocity))
+        alpha = spacing / (2 * (R + altitude))
+        ring_radius = spacing * np.sqrt(max(0.0, 1 - alpha**2))
+        z = altitude - spacing**2 / (2 * (R + altitude))
+        
+        for sat_id, angle in enumerate(self._get_ring_angles(num_sats), start=1):
+            x = ring_radius * np.cos(angle)
+            y = ring_radius * np.sin(angle)
+            position = np.array([x, y, z])
+            velocity = np.array([0.0, 0.0, 0.0])
+            self.satellites.append(Satellite(id=sat_id, position=position, velocity=velocity))
+
+    def _get_ring_angles(self, num_sats: int) -> np.ndarray:
+        if num_sats <= 1:
+            return np.array([])
+        if num_sats == 2:
+            return np.array([0.0])
+        if num_sats == 3:
+            return np.array([0.0, np.pi / 2])
+        
+        ring_count = num_sats - 1
+        return np.arange(ring_count) * 2 * np.pi / ring_count
+
+    def _build_ground_geometry_matrix(self, target_pos: np.ndarray) -> np.ndarray:
+        if len(self.satellites) < 3:
+            return np.empty((0, 2))
+        
+        sat_positions = np.array([sat.position for sat in self.satellites], dtype=float)
+        reference_diff = target_pos - sat_positions[0]
+        reference_dist = np.linalg.norm(reference_diff)
+        if reference_dist == 0:
+            return np.empty((0, 2))
+        
+        reference_unit = reference_diff / reference_dist
+        rows = []
+        for sat_pos in sat_positions[1:]:
+            diff = target_pos - sat_pos
+            dist = np.linalg.norm(diff)
+            if dist == 0:
+                continue
+            unit_vec = diff / dist
+            rows.append((unit_vec - reference_unit)[:2])
+        
+        if not rows:
+            return np.empty((0, 2))
+        
+        return np.array(rows, dtype=float)
+
+    def is_ground_geometry_valid(self, target_pos: Optional[np.ndarray] = None) -> bool:
+        if target_pos is None:
+            if self.estimated_position is not None:
+                target_pos = self.estimated_position
+            elif self.emitter is not None:
+                target_pos = self.emitter.position
+            else:
+                return False
+        
+        H = self._build_ground_geometry_matrix(np.asarray(target_pos, dtype=float))
+        return H.shape[0] >= 2 and np.linalg.matrix_rank(H) == 2
     
     def _create_emitter(self, offset_x: float = 0.0, offset_y: float = 0.0):
         position = np.array([offset_x, offset_y, 0.0])
@@ -222,6 +254,7 @@ class TDOALocalizationSimulator:
         self.snr_values = []
         self.rx_power_values = []
         self.off_axis_angles = []
+        self.antenna_gain_losses = []
         time_errors = []
         
         pointing = np.array([0.0, 0.0, 1.0])
@@ -235,6 +268,8 @@ class TDOALocalizationSimulator:
             direction = (sat_pos - emitter_pos) / np.linalg.norm(sat_pos - emitter_pos)
             off_axis = np.degrees(np.arccos(np.clip(np.dot(pointing, direction), -1, 1)))
             self.off_axis_angles.append(off_axis)
+            az_deg, el_deg = self._calculate_az_el(pointing, direction)
+            self.antenna_gain_losses.append(self._get_antenna_gain_loss(az_deg, el_deg))
             
             time_rmse = self.calculate_tdoa_precision(snr_db)
             time_errors.append(time_rmse)
@@ -261,16 +296,15 @@ class TDOALocalizationSimulator:
     def _tdoa_numerical_optimization(self, stations: np.ndarray, tdoa_measurements: np.ndarray) -> np.ndarray:
         stations_m = stations * 1e3
         
-        def cost_function(target_pos):
+        def cost_function(target_xy):
+            target_pos = np.array([target_xy[0], target_xy[1], 0.0])
             distances = np.array([np.linalg.norm(sat_pos - target_pos) for sat_pos in stations_m])
             predicted_tdoas = (distances - distances[0]) / C
             return np.sum((predicted_tdoas[1:] - tdoa_measurements[1:]) ** 2)
         
         from scipy.optimize import differential_evolution
-        
-        avg_sat_pos = np.mean(stations_m, axis=0)
 
-        bounds = [(-1000e3, 1000e3), (-1000e3, 1000e3), (-10e3, 10e3)]
+        bounds = [(-1000e3, 1000e3), (-1000e3, 1000e3)]
         
         result = differential_evolution(
             cost_function,
@@ -280,7 +314,7 @@ class TDOALocalizationSimulator:
             seed=42
         )
         
-        position_km = result.x / 1e3
+        position_km = np.array([result.x[0], result.x[1], 0.0]) / 1e3
         self.estimated_position = position_km
         return position_km
     
@@ -291,8 +325,6 @@ class TDOALocalizationSimulator:
         if len(self.satellites) < 3:
             return float('inf')
         
-        sat_positions = np.array([sat.position for sat in self.satellites])
-        
         if self.estimated_position is None:
             if self.emitter is None:
                 return float('inf')
@@ -300,24 +332,12 @@ class TDOALocalizationSimulator:
         else:
             target_pos = self.estimated_position
         
-        H = []
-        for i in range(1, len(sat_positions)):
-            diff_i = target_pos - sat_positions[i]
-            dist_i = np.linalg.norm(diff_i)
-            unit_vec_i = diff_i / dist_i
-            
-            diff_0 = target_pos - sat_positions[0]
-            dist_0 = np.linalg.norm(diff_0)
-            unit_vec_0 = diff_0 / dist_0
-            
-            row = unit_vec_i - unit_vec_0
-            H.append(row)
-        
-        H = np.array(H)
-        
+        H = self._build_ground_geometry_matrix(np.asarray(target_pos, dtype=float))
         try:
-            H_pseudo_inv = np.linalg.pinv(H.T @ H)
-            gdop = np.sqrt(np.trace(H_pseudo_inv))
+            if H.shape[0] < 2 or np.linalg.matrix_rank(H) < 2:
+                gdop = float('inf')
+            else:
+                gdop = np.sqrt(np.trace(np.linalg.inv(H.T @ H)))
         except Exception:
             gdop = float('inf')
         
@@ -355,6 +375,7 @@ class TDOALocalizationSimulator:
         gdop = self.calculate_gdop()
         
         true_pos = self.emitter.position
+        geometry_valid = self.is_ground_geometry_valid(true_pos)
         self.position_error = np.linalg.norm((estimated_pos - true_pos) * 1e3)  # Convert to meters
         
         required_spacing = self.calculate_required_satellite_spacing()
@@ -367,9 +388,11 @@ class TDOALocalizationSimulator:
             'snr_values': self.snr_values,
             'rx_power_values': self.rx_power_values,
             'off_axis_angles': self.off_axis_angles,
+            'antenna_gain_losses': self.antenna_gain_losses,
             'tdoa_measurements': tdoa_meas,
             'required_spacing': required_spacing,
-            'satellites': self.satellites
+            'satellites': self.satellites,
+            'geometry_valid': geometry_valid
         }
 
 
@@ -380,9 +403,15 @@ class MonteCarloAnalysis:
     def run_analysis(self, num_runs: int = 20, spacing_range: Tuple[float, float] = (50e3, 300e3), 
                      progress_callback: Optional[Callable] = None) -> dict:
         spacings = np.linspace(spacing_range[0], spacing_range[1], 10)
+        median_errors = []
+        p25_errors = []
+        p75_errors = []
         mean_errors = []
         std_errors = []
         gdop_values = []
+        all_errors = []
+        worst_snr_values = []
+        max_gain_loss_values = []
         
         total_steps = len(spacings)
         
@@ -393,6 +422,8 @@ class MonteCarloAnalysis:
             self.params.satellite_spacing = spacing
             errors = []
             gdops = []
+            worst_snrs = []
+            max_gain_losses = []
             
             for _ in range(num_runs):
                 sim = TDOALocalizationSimulator(self.params)
@@ -400,23 +431,44 @@ class MonteCarloAnalysis:
                     result = sim.run_simulation()
                     errors.append(result['position_error'])
                     gdops.append(result['gdop'])
+                    worst_snrs.append(np.min(result['snr_values']))
+                    max_gain_losses.append(np.max(result['antenna_gain_losses']))
                 except:
                     continue
             
             if errors:
+                errors = np.array(errors, dtype=float)
+                gdops = np.array(gdops, dtype=float)
+                median_errors.append(np.median(errors))
+                p25_errors.append(np.percentile(errors, 25))
+                p75_errors.append(np.percentile(errors, 75))
                 mean_errors.append(np.mean(errors))
                 std_errors.append(np.std(errors))
                 gdop_values.append(np.mean(gdops))
+                all_errors.extend(errors.tolist())
+                worst_snr_values.append(np.median(worst_snrs))
+                max_gain_loss_values.append(np.median(max_gain_losses))
             else:
+                median_errors.append(float('inf'))
+                p25_errors.append(float('inf'))
+                p75_errors.append(float('inf'))
                 mean_errors.append(float('inf'))
                 std_errors.append(0)
                 gdop_values.append(float('inf'))
+                worst_snr_values.append(float('nan'))
+                max_gain_loss_values.append(float('nan'))
         
         return {
             'spacings': spacings,
+            'median_errors': np.array(median_errors),
+            'p25_errors': np.array(p25_errors),
+            'p75_errors': np.array(p75_errors),
             'mean_errors': np.array(mean_errors),
             'std_errors': np.array(std_errors),
-            'gdop_values': np.array(gdop_values)
+            'gdop_values': np.array(gdop_values),
+            'all_errors': np.array(all_errors),
+            'worst_snr_values': np.array(worst_snr_values),
+            'max_gain_loss_values': np.array(max_gain_loss_values)
         }
     
     def find_minimum_spacing(self, target_accuracy: float = 100.0, num_runs: int = 10,
@@ -433,26 +485,14 @@ class MonteCarloAnalysis:
             sim = TDOALocalizationSimulator(self.params)
             sim.setup_scenario(0, 0)
             
-            sat_positions = np.array([sat.position for sat in sim.satellites])
             target_pos = np.array([0.0, 0.0, 0.0])
-            
-            H = []
-            for i in range(1, len(sat_positions)):
-                diff = sat_positions[i] - target_pos
-                dist = np.linalg.norm(diff)
-                unit_vec = diff / dist
-                ref_diff = sat_positions[0] - target_pos
-                ref_dist = np.linalg.norm(ref_diff)
-                ref_unit = ref_diff / ref_dist
-                
-                row = unit_vec - ref_unit
-                H.append(row)
-            
-            H = np.array(H)
-            
+
+            H = sim._build_ground_geometry_matrix(target_pos)
             try:
-                H_pseudo_inv = np.linalg.pinv(H.T @ H)
-                gdop = np.sqrt(np.trace(H_pseudo_inv))
+                if H.shape[0] < 2 or np.linalg.matrix_rank(H) < 2:
+                    gdop = float('inf')
+                else:
+                    gdop = np.sqrt(np.trace(np.linalg.inv(H.T @ H)))
             except Exception:
                 gdop = float('inf')
             
@@ -469,6 +509,10 @@ class LEOSimulationGUI:
         self.root = root
         self.root.title("LEO卫星TDOA定位仿真系统")
         self.root.geometry("1600x900")
+        try:
+            self.root.state('zoomed')
+        except tk.TclError:
+            pass
         
         self.params = SimulationParameters()
         self.simulator = TDOALocalizationSimulator(self.params)
@@ -535,17 +579,17 @@ class LEOSimulationGUI:
         row += 1
         
         ttk.Label(params_frame, text="卫星高度 (km):").grid(row=row, column=0, sticky=tk.W)
-        self.alt_var = tk.StringVar(value="500")
+        self.alt_var = tk.StringVar(value="600")
         ttk.Entry(params_frame, textvariable=self.alt_var, width=12).grid(row=row, column=1, sticky=tk.W)
         row += 1
         
         ttk.Label(params_frame, text="卫星数量:").grid(row=row, column=0, sticky=tk.W)
-        self.num_sat_var = tk.StringVar(value="4")
+        self.num_sat_var = tk.StringVar(value="3")
         ttk.Entry(params_frame, textvariable=self.num_sat_var, width=12).grid(row=row, column=1, sticky=tk.W)
         row += 1
         
         ttk.Label(params_frame, text="卫星间距 (km):").grid(row=row, column=0, sticky=tk.W)
-        self.spacing_var = tk.StringVar(value="300")
+        self.spacing_var = tk.StringVar(value="100")
         ttk.Entry(params_frame, textvariable=self.spacing_var, width=12).grid(row=row, column=1, sticky=tk.W)
         row += 1
         
@@ -578,12 +622,14 @@ class LEOSimulationGUI:
         ttk.Separator(params_frame, orient=tk.HORIZONTAL).grid(row=row, column=0, columnspan=2, sticky=tk.EW, pady=10)
         row += 1
         
-        ttk.Label(params_frame, text="定位要求").grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=(5,2))
-        row += 1
-        
-        ttk.Label(params_frame, text="目标精度 (m):").grid(row=row, column=0, sticky=tk.W)
-        self.accuracy_var = tk.StringVar(value="100")
+        ttk.Label(params_frame, text="定位精度要求 (m):").grid(row=row, column=0, sticky=tk.W)
+        self.accuracy_var = tk.StringVar(value="1000")
         ttk.Entry(params_frame, textvariable=self.accuracy_var, width=12).grid(row=row, column=1, sticky=tk.W)
+        row += 1
+
+        ttk.Label(params_frame, text="蒙特卡洛次数:").grid(row=row, column=0, sticky=tk.W)
+        self.mc_runs_var = tk.StringVar(value="20")
+        ttk.Entry(params_frame, textvariable=self.mc_runs_var, width=12).grid(row=row, column=1, sticky=tk.W)
         row += 1
         
         button_frame = ttk.Frame(params_frame)
@@ -596,8 +642,19 @@ class LEOSimulationGUI:
         results_frame = ttk.LabelFrame(parent, text="仿真结果", padding=10)
         results_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
-        self.results_text = tk.Text(results_frame, height=20, width=40, font=('Consolas', 9))
+        x_scrollbar = ttk.Scrollbar(results_frame, orient=tk.HORIZONTAL)
+        x_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        self.results_text = tk.Text(
+            results_frame,
+            height=20,
+            width=40,
+            font=('Consolas', 9),
+            wrap=tk.NONE,
+            xscrollcommand=x_scrollbar.set
+        )
         self.results_text.pack(fill=tk.BOTH, expand=True)
+        x_scrollbar.config(command=self.results_text.xview)
     
     def _create_visualization_panel(self, parent):
         self.fig = Figure(figsize=(12, 8), dpi=100)
@@ -606,6 +663,7 @@ class LEOSimulationGUI:
         self.ax_2d = self.fig.add_subplot(222)
         self.ax_error = self.fig.add_subplot(223)
         self.ax_gdop = self.fig.add_subplot(224)
+        self.ax_gdop_secondary = None
         
         self.canvas = FigureCanvasTkAgg(self.fig, parent)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -648,6 +706,14 @@ class LEOSimulationGUI:
     def _run_monte_carlo(self):
         if not self._update_parameters():
             return
+
+        try:
+            num_runs = int(self.mc_runs_var.get())
+            if num_runs <= 0:
+                raise ValueError("蒙特卡洛次数必须大于 0")
+        except ValueError as e:
+            messagebox.showerror("参数错误", f"请检查蒙特卡洛次数: {e}")
+            return
         
         progress_window = tk.Toplevel(self.root)
         progress_window.title("蒙特卡洛分析进度")
@@ -674,12 +740,12 @@ class LEOSimulationGUI:
         try:
             min_spacing = self.monte_carlo.find_minimum_spacing(
                 target_accuracy=self.params.required_accuracy,
-                num_runs=10,
+                num_runs=num_runs,
                 progress_callback=update_progress
             )
             
             mc_result = self.monte_carlo.run_analysis(
-                num_runs=10,
+                num_runs=num_runs,
                 progress_callback=update_progress
             )
             
@@ -698,6 +764,9 @@ class LEOSimulationGUI:
         self.root.update()
     
     def _update_visualization(self):
+        if self.ax_gdop_secondary is not None:
+            self.ax_gdop_secondary.remove()
+            self.ax_gdop_secondary = None
         for ax in [self.ax_3d, self.ax_2d, self.ax_error, self.ax_gdop]:
             ax.clear()
         
@@ -803,26 +872,32 @@ class LEOSimulationGUI:
         ax.grid(True, alpha=0.3)
     
     def _update_monte_carlo_visualization(self, mc_result: dict, min_spacing: float):
+        if self.ax_gdop_secondary is not None:
+            self.ax_gdop_secondary.remove()
+            self.ax_gdop_secondary = None
         for ax in [self.ax_3d, self.ax_2d, self.ax_error, self.ax_gdop]:
             ax.clear()
+            ax.set_aspect('auto')
         
         spacings_km = mc_result['spacings']/1e3
-        mean_errors = mc_result['mean_errors']
-        std_errors = mc_result['std_errors']
+        median_errors = mc_result['median_errors']
+        p25_errors = mc_result['p25_errors']
+        p75_errors = mc_result['p75_errors']
         
-        valid_mask = np.isfinite(mean_errors)
+        valid_mask = np.isfinite(median_errors)
         if np.any(valid_mask):
-            y_max = np.max(mean_errors[valid_mask] + std_errors[valid_mask]) * 1.2
-            y_min = max(0, np.min(mean_errors[valid_mask] - std_errors[valid_mask]) * 0.8)
+            y_max = np.max(p75_errors[valid_mask]) * 1.2
+            y_min = max(0, np.min(p25_errors[valid_mask]) * 0.8)
         else:
             y_max = 1000
             y_min = 0
         
-        self.ax_3d.plot(spacings_km, mean_errors, 'b-o', linewidth=2)
+        self.ax_3d.plot(spacings_km, median_errors, 'b-o', linewidth=2, label='误差中位数')
         self.ax_3d.fill_between(spacings_km, 
-                                mean_errors - std_errors,
-                                mean_errors + std_errors,
-                                alpha=0.3)
+                                p25_errors,
+                                p75_errors,
+                                alpha=0.25,
+                                label='25%-75%分位区间')
         self.ax_3d.axhline(y=self.params.required_accuracy, color='r', linestyle='--', label='目标精度')
         min_spacing_km = min_spacing/1e3
         if min_spacing_km <= spacings_km[-1]:
@@ -830,7 +905,7 @@ class LEOSimulationGUI:
         self.ax_3d.set_xlabel('卫星间距 (km)')
         self.ax_3d.set_ylabel('定位误差 (m)')
         self.ax_3d.set_title('定位误差 vs 卫星间距')
-        self.ax_3d.legend()
+        self.ax_3d.legend(loc='upper left', bbox_to_anchor=(0.02, 0.98))
         self.ax_3d.grid(True, alpha=0.3)
         self.ax_3d.set_xlim(spacings_km[0], spacings_km[-1])
         self.ax_3d.set_ylim(y_min, y_max)
@@ -841,26 +916,43 @@ class LEOSimulationGUI:
         self.ax_2d.set_title('几何精度因子 vs 卫星间距')
         self.ax_2d.grid(True, alpha=0.3)
         
-        self.ax_error.hist(mc_result['mean_errors'], bins=15, color='steelblue', alpha=0.7, edgecolor='black')
+        hist_errors = mc_result['all_errors']
+        if hist_errors.size > 0:
+            self.ax_error.hist(hist_errors, bins=20, color='steelblue', alpha=0.7, edgecolor='black')
         self.ax_error.axvline(x=self.params.required_accuracy, color='r', linestyle='--', label='目标精度')
         self.ax_error.set_xlabel('定位误差 (m)')
         self.ax_error.set_ylabel('频次')
-        self.ax_error.set_title('定位误差分布')
+        self.ax_error.set_title('蒙特卡洛定位误差分布')
         self.ax_error.legend()
         
-        self.ax_gdop.text(0.5, 0.7, f'最小卫星间距要求:\n{min_spacing/1e3:.1f} km', 
-                         transform=self.ax_gdop.transAxes, fontsize=14,
-                         ha='center', va='center',
-                         bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
-        
-        self.ax_gdop.text(0.5, 0.3, f'目标精度: {self.params.required_accuracy} m\n'
-                                    f'带宽: {self.params.bandwidth/1e6:.1f} MHz\n'
-                                    f'卫星高度: {self.params.satellite_altitude/1e3:.0f} km',
-                         transform=self.ax_gdop.transAxes, fontsize=11,
-                         ha='center', va='center',
-                         bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
-        self.ax_gdop.set_title('分析结论')
-        self.ax_gdop.axis('off')
+        worst_snr_values = mc_result['worst_snr_values']
+        max_gain_loss_values = mc_result['max_gain_loss_values']
+        self.ax_gdop.plot(spacings_km, worst_snr_values, 'm-^', linewidth=2, label='最差卫星SNR')
+        self.ax_gdop.axhline(y=5, color='red', linestyle='--', alpha=0.5, label='SNR门限')
+        self.ax_gdop.set_xlabel('卫星间距 (km)')
+        self.ax_gdop.set_ylabel('最差卫星SNR (dB)', color='m')
+        self.ax_gdop.tick_params(axis='y', labelcolor='m')
+        self.ax_gdop.grid(True, alpha=0.3)
+        self.ax_gdop.set_title('链路最差点 vs 卫星间距')
+
+        self.ax_gdop_secondary = self.ax_gdop.twinx()
+        self.ax_gdop_secondary.plot(spacings_km, max_gain_loss_values, 'c-d', linewidth=2, label='最大天线损失')
+        self.ax_gdop_secondary.set_ylabel('最大天线损失 (dB)', color='c')
+        self.ax_gdop_secondary.tick_params(axis='y', labelcolor='c')
+
+        left_handles, left_labels = self.ax_gdop.get_legend_handles_labels()
+        right_handles, right_labels = self.ax_gdop_secondary.get_legend_handles_labels()
+        self.ax_gdop.legend(left_handles + right_handles,
+                            left_labels + right_labels,
+                            loc='upper left',
+                            fontsize=9)
+
+        self.ax_gdop.text(0.98, 0.02,
+                          f'最小间距: {min_spacing/1e3:.1f} km\n目标精度: {self.params.required_accuracy:.0f} m',
+                          transform=self.ax_gdop.transAxes,
+                          ha='right', va='bottom',
+                          fontsize=10,
+                          bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
         
         self.fig.tight_layout()
         self.canvas.draw()
@@ -930,16 +1022,17 @@ class LEOSimulationGUI:
         
         text += "【关键结论】\n"
         text += f"  最小卫星间距: {min_spacing/1e3:.1f} km\n"
-        text += f"  最小间距对应精度: {np.min(mc_result['mean_errors']):.1f} m\n\n"
+        text += f"  最小间距对应中位误差: {np.min(mc_result['median_errors']):.1f} m\n\n"
         
         text += "【不同间距下的定位误差】\n"
-        text += "  间距(km)  误差均值(m)  标准差(m)  GDOP\n"
+        text += "  间距km 中位m  P25m  P75m GDOP\n"
         text += "  ─────────────────────────────────────\n"
         for i in range(len(mc_result['spacings'])):
-            text += f"  {mc_result['spacings'][i]/1e3:8.0f}  "
-            text += f"{mc_result['mean_errors'][i]:10.1f}  "
-            text += f"{mc_result['std_errors'][i]:8.1f}  "
-            text += f"{mc_result['gdop_values'][i]:6.2f}\n"
+            text += f"  {mc_result['spacings'][i]/1e3:5.0f} "
+            text += f"{mc_result['median_errors'][i]:6.1f} "
+            text += f"{mc_result['p25_errors'][i]:5.1f} "
+            text += f"{mc_result['p75_errors'][i]:5.1f} "
+            text += f"{mc_result['gdop_values'][i]:4.2f}\n"
         
         text += "\n【理论分析】\n"
         time_res = 1 / self.params.bandwidth
